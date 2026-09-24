@@ -13,6 +13,9 @@ POST /api/aim-solutions               在半角范围内扫描发射角并对偏
                                       出射方向、观察线交点与目标偏差（不入库）
 POST /api/alignment-sensitivities     基准追迹后逐界面将法线旋转 ±扰动角重新追迹，
                                       按中心差分求观察线偏移对法线角度的导数（不入库）
+POST /api/focus-searches              光线只追迹一次，将观察线沿单位法线等距平移扫描，
+                                      逐位置算命中光线质心/RMS，对同编号低谷区间黄金
+                                      分割细化，返回 RMS 最小的最佳位移（不入库）
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ from .geometry import (
     aim_solutions,
     alignment_sensitivities,
     centroid_and_rms,
+    focus_search,
     observation_intersection,
     ray_transmittance,
     sample_directions,
@@ -37,6 +41,8 @@ from .schemas import (
     AlignmentSensitivityOut,
     BeamEvaluationOut,
     BeamRequest,
+    FocusSearchOut,
+    FocusSearchRequest,
     PowerEvaluationOut,
     PowerRequest,
     SegmentOut,
@@ -336,4 +342,76 @@ def compute_alignment_sensitivities(req: SensitivityRequest) -> dict:
         "perturbation_angle_deg": req.perturbation_angle_deg,
         "baseline": _sensitivity_run(result["baseline"]),
         "interfaces": interfaces_out,
+    }
+
+
+@app.post("/api/focus-searches", response_model=FocusSearchOut)
+def search_focus(req: FocusSearchRequest) -> dict:
+    """光线只追迹一次，沿观察线单位法线平移扫描找 RMS 最小的焦面位置。
+
+    沿用光束评估的起点、扇形采样、顺序界面与观察线参数；另收观察线法向有符号
+    位移起止值（起点严格小于终点）与扫描点数（3～101）。扇形光线只追迹一次，
+    随后在 [shift_start, shift_end] 内含端点等间距逐位置将观察线沿单位法线平移，
+    求出射段与平移线的前向交点：命中（追迹完成且前向相交）少于两条的位置无效。
+
+    对连续三个有效扫描点中间 RMS 不高于两端、且三点命中光线编号相同的低谷区间，
+    用黄金分割法细化最多 24 轮；细化试点命中集合改变（或试点无效）即停止该区间，
+    保留已得到的有效试点。最终以全部有效扫描点与细化点中 RMS 最小者为最佳，
+    平局取较小位移；无任何有效位置时 best 为 null。该接口为即时计算，不写入数据库。
+    """
+    interfaces = [
+        (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
+        for itf in req.interfaces
+    ]
+    result = focus_search(
+        req.start.as_tuple(),
+        req.center_direction.as_tuple(),
+        req.half_angle_deg,
+        req.sample_count,
+        req.n_start,
+        interfaces,
+        req.observation_line.point.as_tuple(),
+        req.observation_line.normal.as_tuple(),
+        req.shift_start,
+        req.shift_end,
+        req.scan_points,
+    )
+    scan_out = [
+        {
+            "shift": shift,
+            "hit_count": None if hit_set is None else len(hit_set),
+            "centroid": (
+                None if centroid is None else {"x": centroid[0], "y": centroid[1]}
+            ),
+            "rms_radius": rms,
+        }
+        for shift, hit_set, centroid, rms in result["scan"]
+    ]
+    refined_out = [
+        {
+            "shift": shift,
+            "hit_count": len(hit_set),
+            "centroid": {"x": centroid[0], "y": centroid[1]},
+            "rms_radius": rms,
+        }
+        for shift, hit_set, centroid, rms in result["refined"]
+    ]
+    best = result["best"]
+    return {
+        "half_angle_deg": req.half_angle_deg,
+        "sample_count": req.sample_count,
+        "ray_count": req.sample_count,
+        "shift_start": req.shift_start,
+        "shift_end": req.shift_end,
+        "scan_points": scan_out,
+        "refined_points": refined_out,
+        "best": (
+            None
+            if best is None
+            else {
+                "shift": best[0],
+                "centroid": {"x": best[1][0], "y": best[1][1]},
+                "rms_radius": best[2],
+            }
+        ),
     }

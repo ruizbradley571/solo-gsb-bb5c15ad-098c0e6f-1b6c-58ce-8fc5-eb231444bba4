@@ -17,6 +17,9 @@ AIM_DEV_TOL = 1e-6  # 目标偏差容差：|偏差| 不大于该值即视为命�
 AIM_ANGLE_TOL_DEG = 1e-7  # 角度区间宽容差（度）：二分停止条件，兼作解去重阈值
 AIM_MAX_ITER = 60  # 单个异号区间的最大二分迭代次数
 
+FOCUS_GOLDEN_MAX_ROUNDS = 24  # 单个低谷区间黄金分割细化的最多轮数
+GOLDEN_RATIO = (math.sqrt(5.0) - 1.0) / 2.0  # (√5-1)/2 ≈ 0.618
+
 
 def _dot(a: tuple[float, float], b: tuple[float, float]) -> float:
     return a[0] * b[0] + a[1] * b[1]
@@ -432,3 +435,183 @@ def aim_solutions(
             continue
         deduped.append(sol)
     return deduped
+
+
+def _observation_point_on_line(
+    origin: tuple[float, float],
+    direction: tuple[float, float],
+    line_point: tuple[float, float],
+    line_normal: tuple[float, float],
+) -> tuple[float, float] | None:
+    """给定出射段原点/方向，求其与指定直线的前向交点；平行或交点在身后返回 None。"""
+    return _intersect_line(origin, direction, line_point, line_normal)
+
+
+def focus_search(
+    start: tuple[float, float],
+    center_direction: tuple[float, float],
+    half_angle_deg: float,
+    sample_count: int,
+    n_start: float,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+    obs_point: tuple[float, float],
+    obs_normal: tuple[float, float],
+    shift_start: float,
+    shift_end: float,
+    scan_points: int,
+) -> dict:
+    """沿观察线单位法线平移观察线做焦面扫描，并用黄金分割细化 RMS 低谷。
+
+    光线只追迹一次：先按光束评估相同的扇形采样逐条追迹，保留各光线的出射段；
+    随后将观察线（点 obs_point、单位法线 n）沿 n 平移位移 s（直线点变为
+    obs_point + s·n，法线不变），逐扫描位置 s 求出射段与平移线的前向交点。
+
+    - 仅追迹完成（status=completed）且与平移线有前向交点的光线命中；命中少于
+      两条（命中编号集合大小 < 2）时该位置无效（hit_count/centroid/rms 为 None）。
+    - 在位移 [shift_start, shift_end]（shift_start < shift_end）内含端点等间距取
+      scan_points 个扫描点。
+    - 对连续三个有效扫描点，中间点 RMS 不高于两端（r1 ≤ r0 且 r1 ≤ r2）且三点
+      命中光线编号集合相同的低谷区间，以黄金分割法细化，最多 24 轮；细化中一旦
+      试点的命中集合改变（与区间端点集合不同）或试点无效，立即停止该区间，已得
+      到的有效试点保留。
+    - 以所有有效扫描点与细化点中 RMS 最小者为最佳，平局取较小位移；无任何有效
+      位置时 best 为 None。
+
+    返回 dict：
+      scan:     [(shift, hit_indices|None, centroid|None, rms|None), ...]
+      refined:  [(shift, hit_indices, centroid, rms), ...]（有效细化试点）
+      best:     (shift, centroid, rms) | None
+    """
+    nrm = normalize(obs_normal)
+
+    # 光线只追迹一次：记录每条完成追迹光线的出射段（原点、方向）与其编号
+    fan: list[tuple[int, tuple[float, float], tuple[float, float]]] = []
+    for idx, (_angle, direction) in enumerate(
+        sample_directions(center_direction, half_angle_deg, sample_count)
+    ):
+        segments, status, _reason = trace_ray(start, direction, n_start, interfaces)
+        if status == "completed":
+            fan.append((idx, segments[-1].origin, segments[-1].direction))
+
+    def probe(
+        shift: float,
+    ) -> tuple[frozenset[int], tuple[float, float], float] | None:
+        """在沿法线平移 shift 的观察线上求命中编号集合、质心与 RMS；无效返回 None。"""
+        line_point = (
+            obs_point[0] + shift * nrm[0],
+            obs_point[1] + shift * nrm[1],
+        )
+        hits: list[tuple[int, tuple[float, float]]] = []
+        for ray_idx, seg_origin, seg_dir in fan:
+            point = _observation_point_on_line(seg_origin, seg_dir, line_point, nrm)
+            if point is not None:
+                hits.append((ray_idx, point))
+        if len(hits) < 2:
+            return None  # 少于两条命中：该位置无效
+        points = [point for _idx, point in hits]
+        centroid, rms = centroid_and_rms(points)
+        return frozenset(idx for idx, _p in hits), centroid, rms
+
+    # 等间距扫描（端点精确取 shift_start / shift_end）
+    shifts = [
+        shift_start
+        if i == 0
+        else shift_end
+        if i == scan_points - 1
+        else shift_start
+        + (shift_end - shift_start) * i / (scan_points - 1)
+        for i in range(scan_points)
+    ]
+    scan: list[
+        tuple[float, frozenset[int] | None, tuple[float, float] | None, float | None]
+    ] = []
+    evaluated: list[
+        tuple[float, frozenset[int], tuple[float, float], float]
+    ] = []
+    for shift in shifts:
+        result = probe(shift)
+        if result is None:
+            scan.append((shift, None, None, None))
+        else:
+            hit_set, centroid, rms = result
+            scan.append((shift, hit_set, centroid, rms))
+            evaluated.append((shift, hit_set, centroid, rms))
+
+    refined: list[
+        tuple[float, frozenset[int], tuple[float, float], float]
+    ] = []
+
+    def valid_scan(i: int) -> bool:
+        return scan[i][2] is not None
+
+    # 连续三个有效扫描点构成的低谷区间逐一黄金分割细化
+    for i in range(scan_points - 2):
+        if not (valid_scan(i) and valid_scan(i + 1) and valid_scan(i + 2)):
+            continue
+        s0, set0, _c0, r0 = scan[i]
+        s1, set1, _c1, r1 = scan[i + 1]
+        s2, set2, _c2, r2 = scan[i + 2]
+        if not (r1 <= r0 and r1 <= r2):
+            continue  # 中间点不高于两端才构成低谷
+        if not (set0 == set1 == set2):
+            continue  # 命中光线编号必须相同
+        target_set = set0
+        lo, hi = float(s0), float(s2)
+
+        def trial(
+            s: float,
+        ) -> tuple[frozenset[int], tuple[float, float], float] | None:
+            """细化试点：命中集合改变或无效时返回 None（调用方据此停止区间）。"""
+            result = probe(s)
+            if result is None:
+                return None
+            hit_set, centroid, rms = result
+            if hit_set != target_set:
+                return None  # 命中集合改变：停止该区间
+            return result
+
+        width = hi - lo
+        c = lo + (1.0 - GOLDEN_RATIO) * width
+        d = lo + GOLDEN_RATIO * width
+        rc = trial(c)
+        if rc is None:
+            continue  # 首个内部试点即失效：区间无有效细化点
+        hit_c, cent_c, r_c = rc
+        refined.append((c, hit_c, cent_c, r_c))
+        evaluated.append((c, hit_c, cent_c, r_c))
+        rd = trial(d)
+        if rd is None:
+            continue  # 保留 c 处已得到的有效试点，停止该区间
+        hit_d, cent_d, r_d = rd
+        refined.append((d, hit_d, cent_d, r_d))
+        evaluated.append((d, hit_d, cent_d, r_d))
+
+        for _round in range(FOCUS_GOLDEN_MAX_ROUNDS):
+            if r_c < r_d:
+                hi, d, r_d, hit_d, cent_d = d, c, r_c, hit_c, cent_c
+                width = hi - lo
+                c = lo + (1.0 - GOLDEN_RATIO) * width
+                rc_new = trial(c)
+                if rc_new is None:
+                    break  # 命中集合改变或试点无效：停止该区间，保留已得试点
+                hit_c, cent_c, r_c = rc_new
+                refined.append((c, hit_c, cent_c, r_c))
+                evaluated.append((c, hit_c, cent_c, r_c))
+            else:
+                lo, c, r_c, hit_c, cent_c = c, d, r_d, hit_d, cent_d
+                width = hi - lo
+                d = lo + GOLDEN_RATIO * width
+                rd_new = trial(d)
+                if rd_new is None:
+                    break
+                hit_d, cent_d, r_d = rd_new
+                refined.append((d, hit_d, cent_d, r_d))
+                evaluated.append((d, hit_d, cent_d, r_d))
+
+    # RMS 最小者为最佳，平局取较小位移
+    best: tuple[float, tuple[float, float], float] | None = None
+    for shift, _hit_set, centroid, rms in evaluated:
+        if best is None or rms < best[2] or (rms == best[2] and shift < best[0]):
+            best = (shift, centroid, rms)
+
+    return {"scan": scan, "refined": refined, "best": best}
