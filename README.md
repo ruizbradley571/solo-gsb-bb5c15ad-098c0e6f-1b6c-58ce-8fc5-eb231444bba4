@@ -33,6 +33,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/power-evaluations` | 复用光束采样与追迹，按菲涅耳公式逐界面累乘 s/p 透过率，返回各光线功率与功率加权质心（不入库） |
 | POST | `/api/aim-solutions` | 扫描发射角并对偏差异号区间二分，求解命中观察线目标偏移量的光线（不入库） |
 | POST | `/api/alignment-sensitivities` | 基准追迹后逐界面将法线旋转 ±扰动角重新追迹，中心差分求观察线偏移对法线角度的导数（不入库） |
+| POST | `/api/focus-searches` | 光线只追迹一次，沿观察线单位法线等距平移扫描光斑质心/RMS，对命中集合相同的低谷黄金分割细化，返回 RMS 最小的焦点位置（不入库） |
 
 ### 请求示例
 
@@ -334,6 +335,74 @@ curl -X POST http://localhost:8000/api/alignment-sensitivities \
 - `baseline`：基准追迹状态 `status`（`completed` / `total_internal_reflection` / `no_intersection` / `no_observation_intersection`）、停止原因 `reason`、观察线前向交点 `observation_point` 与基准有符号偏移 `offset`；失效时后两者为 `null`。
 - `interfaces[]` 与请求界面一一对应：`interface_index` 为序号，`plus` / `minus` 分别为法线旋转 `+δ` / `−δ` 后的追迹结果（字段同基准，另含扰动后的单位法线与实际扰动角）；`derivative_per_deg` 为中心差分导数（长度/度），任一侧或基准失效时为 `null`。
 
+## 焦点搜索（观察线沿法线平移找 RMS 最小点）
+
+`POST /api/focus-searches` 沿用光束评估的**起点、扇形采样（中心方向、对称半角、采样数）、顺序界面与观察线**参数，另收观察线**法向有符号位移**的起止值与扫描点数，沿观察线单位法线平移观察线，逐位置评估光斑 RMS，返回 RMS 最小的焦点位置。该接口为即时计算，结果不写入数据库。
+
+- **观察线平移**：将观察线法线归一化为单位法线 `n`，位移 `shift` 处的平移线经过 `观察线给定点 + shift·n`（法线方向不变）。位移为有符号值，沿 `n` 为正；`shift_start` 必须严格小于 `shift_end`，扫描在二者之间取 `scan_count`（**3～101**，含端点）个**等距**位置。
+- **光线只追迹一次**：扇形采样光线（与光束评估相同的 `[-half_angle_deg, +half_angle_deg]` 等距采样）在整个扫描与细化过程中**只追迹一次**，缓存其出射段；每个位置只做一次出射段与平移线的前向求交。
+- **逐位置统计**：仅对**追迹完成**且与平移线存在**前向**交点的光线，计算交点的**质心**与 **RMS 半径**（定义同光束评估）；命中光线**少于两条**的扫描位置记为无效（`rms_radius` 为 `null`）。
+- **低谷细化（黄金分割法）**：对**连续三个有效**扫描点，若中间点 RMS **不高于**两端，且三点的**命中光线编号集合相同**，则在两端点之间用黄金分割法细化，**最多 24 轮**（首轮取两个内点 `lo+0.382·L`、`lo+0.618·L`，此后每轮只新算一个内点）。细化试点一旦**命中集合改变**（含由有效变为无效）即**停止该区间**，此前已得到的有效试点全部保留；不跨无效扫描点构造低谷。
+- **最佳选取**：以所有**有效扫描点与细化点**中 RMS 最小者为最佳，**平局取较小位移**；没有任何有效位置时 `best` 为 `null`。
+
+> 说明：纯平面界面的斯涅尔系统出射角对入射角单调，扇形光线在前向区域一般不会真正会聚，真实平板/棱镜场景的 RMS 随观察线远离通常单调（低谷细化可能不触发）；黄金分割细化主要服务于存在近场焦散或命中集合稳定的低反差区间。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/focus-searches` | 光线只追迹一次、沿观察线单位法线等距平移扫描，低谷黄金分割细化，返回各扫描点位移/命中数/RMS 与最佳位移、质心、RMS |
+
+### 焦点搜索请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/focus-searches \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "center_direction": {"x": 1, "y": 0},
+    "half_angle_deg": 10,
+    "sample_count": 21,
+    "n_start": 1.0,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.5},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}},
+    "shift_start": 0,
+    "shift_end": 6,
+    "scan_count": 7
+  }'
+```
+
+### 焦点搜索响应说明
+
+```json
+{
+  "half_angle_deg": 10.0,
+  "sample_count": 21,
+  "ray_count": 21,
+  "shift_start": 0.0,
+  "shift_end": 6.0,
+  "scan_count": 7,
+  "scan": [
+    {"shift": 0.0, "hit_count": 21, "rms_radius": 0.9922541551404938},
+    {"shift": 1.0, "hit_count": 21, "rms_radius": 1.0986524352320197},
+    {"shift": 2.0, "hit_count": 21, "rms_radius": 1.2050507163444804}
+  ],
+  "refined": [],
+  "best": {
+    "shift": 0.0,
+    "centroid": {"x": 10.0, "y": 0.0},
+    "rms_radius": 0.9922541551404938
+  }
+}
+```
+
+- `ray_count`：扇形采样光线数（等于 `sample_count`）；`scan_count`：实际扫描点数。
+- `scan[]` 按位移从 `shift_start` 到 `shift_end` 等距排列，每项含 `shift`（观察线法向有符号位移）、`hit_count`（与平移线有前向交点的追迹完成光线数）、`rms_radius`（命中少于两条时为 `null`）。
+- `refined[]`：黄金分割细化得到的有效试点，每项含 `shift`、`hit_count`、`centroid`、`rms_radius`；未触发任何低谷细化时为空列表。
+- `best`：全部有效扫描点与细化点中 RMS 最小（平局取较小位移）的位置，含 `shift`、`centroid`、`rms_radius`；无有效位置时为 `null`。
+- 参数校验失败（如 `shift_start >= shift_end`、`scan_count` 越界 3～101）返回 `422`。
+
 服务地址：API 根路径 http://localhost:8000 ，交互式文档（可在线试调该接口）http://localhost:8000/docs 。
 
 ## 项目结构
@@ -341,7 +410,7 @@ curl -X POST http://localhost:8000/api/alignment-sensitivities \
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）
+  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型
 Dockerfile

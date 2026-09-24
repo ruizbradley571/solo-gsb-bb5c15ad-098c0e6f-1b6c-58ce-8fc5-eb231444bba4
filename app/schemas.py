@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 _EPS = 1e-12
 
@@ -224,3 +224,58 @@ class AlignmentSensitivityOut(BaseModel):
     perturbation_angle_deg: float
     baseline: SensitivityRunOut
     interfaces: list[InterfaceSensitivityOut]
+
+
+class FocusSearchRequest(BeamRequest):
+    """焦点搜索请求：在光束请求基础上增加观察线法向有符号位移扫描范围。
+
+    将观察线沿其单位法线等距平移：shift_start 处平移线经过 观察线给定点 +
+    shift_start·单位法线，shift_end 同理；要求 shift_start < shift_end。
+    """
+
+    shift_start: float = Field(description="观察线法向有符号位移起点")
+    shift_end: float = Field(description="观察线法向有符号位移终点，必须大于起点")
+    scan_count: int = Field(ge=3, le=101, description="扫描点数，3～101（含端点）")
+
+    @model_validator(mode="after")
+    def shift_range_valid(self) -> "FocusSearchRequest":
+        if self.shift_start >= self.shift_end:
+            raise ValueError("位移起点必须小于终点（shift_start < shift_end）")
+        return self
+
+
+class FocusScanPointOut(BaseModel):
+    """一个扫描位置：法向有符号位移、命中光线数与 RMS 半径（无效时为 null）。"""
+
+    shift: float
+    hit_count: int
+    rms_radius: float | None
+
+
+class FocusRefinedPointOut(BaseModel):
+    """低谷区间黄金分割细化得到的一个有效试点。"""
+
+    shift: float
+    hit_count: int
+    centroid: Vec2
+    rms_radius: float
+
+
+class FocusBestOut(BaseModel):
+    """最佳焦点位置：最小 RMS 对应的法向位移、光斑质心与 RMS 半径。"""
+
+    shift: float
+    centroid: Vec2
+    rms_radius: float
+
+
+class FocusSearchOut(BaseModel):
+    half_angle_deg: float
+    sample_count: int
+    ray_count: int
+    shift_start: float
+    shift_end: float
+    scan_count: int
+    scan: list[FocusScanPointOut]
+    refined: list[FocusRefinedPointOut]
+    best: FocusBestOut | None

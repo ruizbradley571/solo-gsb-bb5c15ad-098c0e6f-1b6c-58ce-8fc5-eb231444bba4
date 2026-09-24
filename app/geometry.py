@@ -17,6 +17,12 @@ AIM_DEV_TOL = 1e-6  # 目标偏差容差：|偏差| 不大于该值即视为命�
 AIM_ANGLE_TOL_DEG = 1e-7  # 角度区间宽容差（度）：二分停止条件，兼作解去重阈值
 AIM_MAX_ITER = 60  # 单个异号区间的最大二分迭代次数
 
+FOCUS_MIN_HITS = 2  # 扫描/细化位置有效所需的最少命中光线数
+FOCUS_MAX_ROUNDS = 24  # 单个低谷区间黄金分割细化的最多轮数
+# 黄金分割内点位置：左内点系数 1/φ²≈0.381966，右内点系数 1/φ≈0.618034
+_GOLDEN_TAU = (math.sqrt(5.0) - 1.0) / 2.0  # 1/φ ≈ 0.618034
+_GOLDEN_1MTAU = 1.0 - _GOLDEN_TAU  # 1/φ² ≈ 0.381966
+
 
 def _dot(a: tuple[float, float], b: tuple[float, float]) -> float:
     return a[0] * b[0] + a[1] * b[1]
@@ -432,3 +438,187 @@ def aim_solutions(
             continue
         deduped.append(sol)
     return deduped
+
+
+@dataclass
+class _FocusPoint:
+    """观察线沿法线平移到某个有符号位移处的光斑评估结果。
+
+    ray_indices 为与平移线存在前向交点的光线编号（采样顺序，从 0 起）；
+    命中少于两条时 centroid / rms 为 None，该位置无效。
+    """
+
+    shift: float
+    hit_indices: tuple[int, ...]
+    centroid: tuple[float, float] | None
+    rms: float | None
+
+    @property
+    def valid(self) -> bool:
+        return len(self.hit_indices) >= FOCUS_MIN_HITS
+
+
+def focus_search(
+    start: tuple[float, float],
+    center_direction: tuple[float, float],
+    half_angle_deg: float,
+    sample_count: int,
+    n_start: float,
+    interfaces: list[tuple[tuple[float, float], tuple[float, float], float]],
+    obs_point: tuple[float, float],
+    obs_normal: tuple[float, float],
+    shift_start: float,
+    shift_end: float,
+    scan_count: int,
+) -> dict:
+    """扇形采样光线只追迹一次，沿观察线单位法线等距平移观察线搜索 RMS 最低点。
+
+    观察线平移：给定法线归一化为单位法线 n，位移 s 处的平移线经过
+    obs_point + s·n（法线方向不变），s 从 shift_start 等间距取 scan_count
+    个值到 shift_end（含端点）。每个采样位置统计**追迹完成**且与平移线有
+    **前向**交点的光线，命中少于 FOCUS_MIN_HITS（2）条时该位置无效。
+
+    对连续三个有效采样点，若中间点 RMS 不高于两端且三点命中光线编号集合
+    相同，则视为一个低谷区间，用黄金分割法细化，最多 FOCUS_MAX_ROUNDS（24）
+    轮（首轮取两个内点，之后每轮只新算一个内点）。细化试点一旦命中集合
+    改变（或失效）即停止该区间，此前得到的有效试点全部保留。
+
+    以所有有效扫描点和细化点中 RMS 最小者为最佳，平局取较小位移；没有
+    任何有效位置时 best 为 None。该函数为即时计算，不写入数据库。
+
+    返回 dict：
+      ray_count / scan_count：扇形采样光线数与扫描点数；
+      scan:   [(shift, hit_count, rms|None), ...]（按位移升序，含无效点）；
+      refined:[(shift, hit_count, centroid, rms), ...]（有效细化点，按位移升序）；
+      best:   (shift, centroid, rms) 或 None。
+    """
+    nrm = normalize(obs_normal)
+
+    # 光线只追迹一次：缓存每条采样光线的出射段（未完成追迹的不纳入评估）
+    ray_count = 0
+    traced_rays: list[tuple[float, float]] = []  # 出射段 (origin, direction)
+    for _angle, direction in sample_directions(
+        center_direction, half_angle_deg, sample_count
+    ):
+        ray_count += 1
+        segments, status, _reason = trace_ray(
+            start, direction, n_start, interfaces
+        )
+        if status == "completed":
+            traced_rays.append((segments[-1].origin, segments[-1].direction))
+
+    cache: dict[float, _FocusPoint] = {}
+
+    def evaluate(shift: float) -> _FocusPoint:
+        """评估某个位移处的平移线光斑；同一位移只计算一次。"""
+        if shift in cache:
+            return cache[shift]
+        moved = (obs_point[0] + shift * nrm[0], obs_point[1] + shift * nrm[1])
+        hits: list[tuple[int, tuple[float, float]]] = []
+        for idx, (origin, direction) in enumerate(traced_rays):
+            point = _intersect_line(origin, direction, moved, nrm)
+            if point is not None:
+                hits.append((idx, point))
+        indices = tuple(idx for idx, _p in hits)
+        if len(hits) >= FOCUS_MIN_HITS:
+            stats = centroid_and_rms([p for _idx, p in hits])
+            centroid, rms = stats
+        else:
+            centroid = rms = None
+        point = _FocusPoint(shift, indices, centroid, rms)
+        cache[shift] = point
+        return point
+
+    # 等距扫描（含端点）
+    scan_points: list[_FocusPoint] = []
+    last = scan_count - 1
+    for i in range(scan_count):
+        shift = shift_start if i == 0 else shift_start + (shift_end - shift_start) * i / last
+        scan_points.append(evaluate(shift))
+
+    # 细化点池：(shift, _FocusPoint)，仅记录非扫描位置的有效试点；
+    # 相邻低谷区间收缩时理论上可能探到同一位移，用集合保证每点只入池一次
+    refined_points: list[tuple[float, _FocusPoint]] = []
+    refined_shifts: set[float] = set()
+    scan_shifts = {p.shift for p in scan_points}
+
+    def probe(shift: float, base_set: frozenset[int]) -> _FocusPoint | None:
+        """细化试点：返回有效且命中集合不变的点；失效或集合改变时返回 None。
+
+        命中不少于两条的试点（无论集合是否改变）都作为有效点保留。
+        """
+        fp = evaluate(shift)
+        if fp.valid and shift not in scan_shifts and shift not in refined_shifts:
+            refined_shifts.add(shift)
+            refined_points.append((shift, fp))
+        if not fp.valid or frozenset(fp.hit_indices) != base_set:
+            return None  # 命中集合改变（或失效）：停止该区间
+        return fp
+
+    # 连续三个有效扫描点构成低谷：rms[mid] <= rms[lo] 且 <= rms[hi]，命中集合相同
+    for i in range(len(scan_points) - 2):
+        p0, p1, p2 = scan_points[i], scan_points[i + 1], scan_points[i + 2]
+        if not (p0.valid and p1.valid and p2.valid):
+            continue  # 不跨无效扫描点
+        if not (p1.rms <= p0.rms and p1.rms <= p2.rms):
+            continue
+        sets = frozenset(p0.hit_indices)
+        if not (
+            sets == frozenset(p1.hit_indices) and sets == frozenset(p2.hit_indices)
+        ):
+            continue
+
+        lo, hi = p0.shift, p2.shift
+        # 左内点 a = lo + 0.382L，右内点 b = lo + 0.618L
+        a = lo + _GOLDEN_1MTAU * (hi - lo)
+        b = lo + _GOLDEN_TAU * (hi - lo)
+        fa = fb = None
+        for round_i in range(FOCUS_MAX_ROUNDS):
+            if round_i == 0:
+                # 首轮取两个内点；任一试点命中集合改变即停止，不再算另一个
+                fa = probe(a, sets)
+                if fa is None:
+                    break
+                fb = probe(b, sets)
+                if fb is None:
+                    break
+                continue
+            # 后续每轮只新算一个内点，另一个由上轮幸存点复用
+            if fa.rms <= fb.rms:
+                # 最小点偏左：新区间 [lo, b]；幸存点 a 变为新左内点，新算右内点
+                hi = b
+                b, fb = a, fa
+                a = lo + _GOLDEN_1MTAU * (hi - lo)
+                fa = probe(a, sets)
+            else:
+                # 最小点偏右：新区间 [a, hi]；幸存点 b 变为新右内点，新算左内点
+                lo = a
+                a, fa = b, fb
+                b = lo + _GOLDEN_TAU * (hi - lo)
+                fb = probe(b, sets)
+            if fa is None or fb is None:
+                break
+
+    # 以 RMS 最小为最佳，平局取较小位移
+    candidates: list[tuple[float, _FocusPoint]] = [
+        (p.shift, p) for p in scan_points if p.valid
+    ]
+    candidates.extend(refined_points)
+    best: tuple[float, tuple[float, float], float] | None = None
+    if candidates:
+        best_shift, best_fp = min(
+            candidates, key=lambda item: (item[1].rms, item[0])
+        )
+        best = (best_shift, best_fp.centroid, best_fp.rms)
+
+    refined_points.sort(key=lambda item: item[0])
+    return {
+        "ray_count": ray_count,
+        "scan_count": scan_count,
+        "scan": [(p.shift, len(p.hit_indices), p.rms) for p in scan_points],
+        "refined": [
+            (p.shift, len(p.hit_indices), p.centroid, p.rms)
+            for _shift, p in refined_points
+        ],
+        "best": best,
+    }
